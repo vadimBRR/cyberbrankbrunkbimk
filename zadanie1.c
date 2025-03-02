@@ -1,10 +1,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <locale.h>
+#include <wchar.h>
 
-#define MIN_PASSWORD_LENGTH 8
+#define MIN_PASSWORD_LENGTH 0
 #define MIXER_STRING "ceramirxorrev"  
-
 unsigned char rotate_left(unsigned char value, int shift) {
     return (value << shift) | (value >> (8 - shift));
 }
@@ -21,28 +22,37 @@ unsigned char bit_mirror(unsigned char value) {
     return mirrored;
 }
 
-// Encrypt password
 char* mix_password(const char* password) {
-  size_t pass_len = strlen(password);
+  size_t pass_len = mbstowcs(NULL, password, 0);  
   size_t mix_len = strlen(MIXER_STRING);
 
-  if (pass_len + mix_len >= 256) {
-      fprintf(stderr, "Error: Password too long!\n");
+  if (pass_len == (size_t)-1) {
+      fprintf(stderr, "Error: Invalid password\n");
       exit(1);
   }
 
-  char* mixed_key = malloc(pass_len + 1);
+  wchar_t* wide_password = malloc((pass_len + 1) * sizeof(wchar_t));
+  if (!wide_password) {
+      exit(1);
+  }
+
+  // wchar_t
+  mbstowcs(wide_password, password, pass_len + 1);
+
+  wchar_t* mixed_key = malloc((pass_len + 1) * sizeof(wchar_t));
   if (!mixed_key) {
-      fprintf(stderr, "Memory allocation error\n");
+      free(wide_password);
       exit(1);
   }
 
-  strcpy(mixed_key, password);
+  wcscpy(mixed_key, wide_password);
 
+  // xor
   for (size_t i = 0; i < pass_len; i++) {
       mixed_key[i] ^= MIXER_STRING[i % mix_len];
   }
 
+  // 3. xor
   for (size_t i = 0; i < pass_len - 1; i++) {
       mixed_key[i] ^= mixed_key[i + 1];
   }
@@ -53,39 +63,42 @@ char* mix_password(const char* password) {
       }
   }
 
-  mixed_key[pass_len] = '\0';
-  return mixed_key;
-}
+  // wchar_t to char
+  size_t utf8_len = wcstombs(NULL, mixed_key, 0) + 1;  
+  char* final_key = malloc(utf8_len);
+  if (!final_key) {
+      free(wide_password);
+      free(mixed_key);
+      exit(1);
+  }
 
+  wcstombs(final_key, mixed_key, utf8_len);  
+  free(wide_password);
+  free(mixed_key);
+
+  return final_key;
+}
 
 
 void encrypted_text(const char* key, FILE* input, FILE* output) {
     char buf;
-    char* mixed_key = mix_password(key); 
-    if (!mixed_key) return;
-
-    size_t key_len = strlen(mixed_key);
+    size_t key_len = strlen(key);  
     size_t i = 0;
 
     while (fread(&buf, 1, 1, input)) {
-        // 1. caesar
-        char shifted = (buf + mixed_key[i % key_len]) % 256;
+        unsigned char key_byte = (unsigned char) key[i % key_len]; 
 
-        // 2. XOR
-        char xored = shifted ^ mixed_key[i % key_len];
+        char shifted = (buf + key_byte) % 256;
+        char xored = shifted ^ key_byte;
 
-        // 3.  XOR but not XOR
         char final;
         if (i % 2 == 0) {
-            final = xored ^ mixed_key[i % key_len];
+            final = xored ^ key_byte;
         } else {
-            final = xored ^ mixed_key[key_len - (i % key_len) - 1];
+            final = xored ^ (unsigned char) key[key_len - (i % key_len) - 1];
         }
 
-        // 4. Bit shift left
-        final = rotate_left(final, mixed_key[i % key_len] % 8);
-
-        // 5. bit mirror
+        final = rotate_left(final, key_byte % 8);
         if (i % 2 == 0) {
             final = bit_mirror(final);
         }
@@ -93,51 +106,42 @@ void encrypted_text(const char* key, FILE* input, FILE* output) {
         fwrite(&final, 1, 1, output);
         i++;
     }
-
-    free(mixed_key);
-
 }
 
 void decrypt_text(const char* key, FILE* input, FILE* output) {
     char buf;
-    char* mixed_key = mix_password(key); 
-    if (!mixed_key) return;
-
-    size_t key_len = strlen(mixed_key);
+    size_t key_len = strlen(key);  
     size_t i = 0;
 
     while (fread(&buf, 1, 1, input)) {
-        // 1. bit mirror
+        unsigned char key_byte = (unsigned char) key[i % key_len];  
+
         if (i % 2 == 0) {
             buf = bit_mirror(buf);
         }
 
-        // 2. bit shift right
-        char reversed_rotate = rotate_right(buf, mixed_key[i % key_len] % 8);
-
-        // 3. XOR but not XOR
+        char reversed_rotate = rotate_right(buf, key_byte % 8);
         char reversed_xor;
+
         if (i % 2 == 0) {
-            reversed_xor = reversed_rotate ^ mixed_key[i % key_len];
+            reversed_xor = reversed_rotate ^ key_byte;
         } else {
-            reversed_xor = reversed_rotate ^ mixed_key[key_len - (i % key_len) - 1];
+            reversed_xor = reversed_rotate ^ (unsigned char) key[key_len - (i % key_len) - 1];
         }
 
-        // 4. XOR 
-        char reversed_xored = reversed_xor ^ mixed_key[i % key_len];
-
-        // 5. caesar 
-        char original = (reversed_xored - mixed_key[i % key_len] + 256) % 256;
+        char reversed_xored = reversed_xor ^ key_byte;
+        char original = (reversed_xored - key_byte + 256) % 256;
 
         fwrite(&original, 1, 1, output);
         i++;
     }
-    free(mixed_key);
-
 }
+
+
+
 int validate_input(int encrypt, const char *key, const char *input_file, const char *output_file) {
     if (strlen(key) < MIN_PASSWORD_LENGTH) {
-        fprintf(stderr, "Error: Password must be at least %d characters long.\n", MIN_PASSWORD_LENGTH);
+        fprintf(stderr, "Error: Password must be at least %d characters long\n", MIN_PASSWORD_LENGTH);
         return 0;
     }
 
@@ -186,7 +190,7 @@ int parse_args(int argc, char *argv[], int *encrypt, char **key, char **input_fi
             *encrypt = 0;
         } else if (strcmp(argv[i], "-p") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Error: No password provided after -p\n");
+                fprintf(stderr, "Error: No passwrd provided after -p\n");
                 return 0;
             }
             *key = argv[++i];
@@ -233,6 +237,7 @@ int parse_args(int argc, char *argv[], int *encrypt, char **key, char **input_fi
 
 
 int main(int argc, char *argv[]) {
+    setlocale(LC_ALL, "");  
     char *input_file = NULL;
     char *output_file = NULL;
     char *key = NULL;
@@ -259,12 +264,14 @@ int main(int argc, char *argv[]) {
         fclose(input);
         return 1;
     }
+    char* new_key = mix_password(key);
 
     if (encrypt) {
-      encrypted_text(key, input, output);
+      encrypted_text(new_key, input, output);
     } else {
-        decrypt_text(key, input, output);
+        decrypt_text(new_key, input, output);
     }
+    free(new_key);
     fclose(input);
     fclose(output);
 
